@@ -3,4 +3,8 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
 	plugins: [tailwindcss()],
+	server: {
+		port: 8901,
+		host: true,
+	},
 });
