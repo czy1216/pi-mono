@@ -529,7 +529,7 @@ const { session } = await createAgentSession({
 ### Custom Tools
 
 ```typescript
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { createAgentSession, defineTool } from "@mariozechner/pi-coding-agent";
 
 // Inline custom tool
@@ -779,7 +779,7 @@ sm.branchWithSummary(id, "Summary...");  // Branch with context summary
 sm.createBranchedSession(leafId);       // Extract path to new file
 ```
 
-> See [examples/sdk/11-sessions.ts](../examples/sdk/11-sessions.ts) and [docs/session.md](session.md)
+> See [examples/sdk/11-sessions.ts](../examples/sdk/11-sessions.ts) and [Session Format](session-format.md)
 
 ### Settings Management
 
@@ -882,7 +882,7 @@ interface LoadExtensionsResult {
 
 ```typescript
 import { getModel } from "@mariozechner/pi-ai";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import {
   AuthStorage,
   bashTool,

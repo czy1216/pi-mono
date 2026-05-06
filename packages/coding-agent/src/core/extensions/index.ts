@@ -29,6 +29,7 @@ export type {
 	AppendEntryHandler,
 	// App keybindings (for custom editors)
 	AppKeybinding,
+	AutocompleteProviderFactory,
 	// Events - Tool (ToolCallEvent types)
 	BashToolCallEvent,
 	BashToolResultEvent,
@@ -46,6 +47,7 @@ export type {
 	ContextUsage,
 	CustomToolCallEvent,
 	CustomToolResultEvent,
+	EditorFactory,
 	EditToolCallEvent,
 	EditToolResultEvent,
 	ExecOptions,
@@ -103,6 +105,7 @@ export type {
 	// Commands
 	RegisteredCommand,
 	RegisteredTool,
+	ReplacedSessionContext,
 	ResolvedCommand,
 	// Events - Resources
 	ResourcesDiscoverEvent,

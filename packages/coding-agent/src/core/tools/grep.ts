@@ -1,10 +1,10 @@
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Text } from "@mariozechner/pi-tui";
-import { type Static, Type } from "@sinclair/typebox";
 import { spawn } from "child_process";
 import { readFileSync, statSync } from "fs";
 import path from "path";
+import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import { ensureTool } from "../../utils/tools-manager.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
@@ -215,7 +215,7 @@ export function createGrepToolDefinition(
 						if (ignoreCase) args.push("--ignore-case");
 						if (literal) args.push("--fixed-strings");
 						if (glob) args.push("--glob", glob);
-						args.push(pattern, searchPath);
+						args.push("--", pattern, searchPath);
 
 						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 						const rl = createInterface({ input: child.stdout });

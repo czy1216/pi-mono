@@ -1,13 +1,14 @@
 import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
 import { getEnvApiKey } from "../env-api-keys.js";
-import { supportsXhigh } from "../models.js";
+import { clampThinkingLevel } from "../models.js";
 import type {
 	Api,
 	AssistantMessage,
 	CacheRetention,
 	Context,
 	Model,
+	OpenAIResponsesCompat,
 	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
@@ -15,9 +16,10 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
+import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
-import { buildBaseOptions, clampReasoning } from "./simple-options.js";
+import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 
@@ -35,18 +37,18 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	return "short";
 }
 
-/**
- * Get prompt cache retention based on cacheRetention and base URL.
- * Only applies to direct OpenAI API calls (api.openai.com).
- */
-function getPromptCacheRetention(baseUrl: string, cacheRetention: CacheRetention): "24h" | undefined {
-	if (cacheRetention !== "long") {
-		return undefined;
-	}
-	if (baseUrl.includes("api.openai.com")) {
-		return "24h";
-	}
-	return undefined;
+function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCompat> {
+	return {
+		sendSessionIdHeader: model.compat?.sendSessionIdHeader ?? true,
+		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
+	};
+}
+
+function getPromptCacheRetention(
+	compat: Required<OpenAIResponsesCompat>,
+	cacheRetention: CacheRetention,
+): "24h" | undefined {
+	return cacheRetention === "long" && compat.supportsLongCacheRetention ? "24h" : undefined;
 }
 
 // OpenAI Responses-specific options
@@ -97,15 +99,18 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
-			const { data: openaiStream, response } = await client.responses
-				.create(params, options?.signal ? { signal: options.signal } : undefined)
-				.withResponse();
+			const requestOptions = {
+				...(options?.signal ? { signal: options.signal } : {}),
+				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
+				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
+			};
+			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
 			await processResponsesStream(openaiStream, output, stream, model, {
 				serviceTier: options?.serviceTier,
-				applyServiceTierPricing,
+				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			});
 
 			if (options?.signal?.aborted) {
@@ -145,7 +150,8 @@ export const streamSimpleOpenAIResponses: StreamFunction<"openai-responses", Sim
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	const reasoningEffort = supportsXhigh(model) ? options?.reasoning : clampReasoning(options?.reasoning);
+	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
 	return streamOpenAIResponses(model, context, {
 		...base,
@@ -169,6 +175,7 @@ function createClient(
 		apiKey = process.env.OPENAI_API_KEY;
 	}
 
+	const compat = getCompat(model);
 	const headers = { ...model.headers };
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
@@ -180,7 +187,9 @@ function createClient(
 	}
 
 	if (sessionId) {
-		headers.session_id = sessionId;
+		if (compat.sendSessionIdHeader) {
+			headers.session_id = sessionId;
+		}
 		headers["x-client-request-id"] = sessionId;
 	}
 
@@ -189,11 +198,20 @@ function createClient(
 		Object.assign(headers, optionsHeaders);
 	}
 
+	const defaultHeaders =
+		model.provider === "cloudflare-ai-gateway"
+			? {
+					...headers,
+					Authorization: headers.Authorization ?? null,
+					"cf-aig-authorization": `Bearer ${apiKey}`,
+				}
+			: headers;
+
 	return new OpenAI({
 		apiKey,
-		baseURL: model.baseUrl,
+		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders: headers,
+		defaultHeaders,
 	});
 }
 
@@ -201,12 +219,13 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS);
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	const compat = getCompat(model);
 	const params: ResponseCreateParamsStreaming = {
 		model: model.id,
 		input: messages,
 		stream: true,
 		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
-		prompt_cache_retention: getPromptCacheRetention(model.baseUrl, cacheRetention),
+		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
 		store: false,
 	};
 
@@ -222,38 +241,50 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.service_tier = options.serviceTier;
 	}
 
-	if (context.tools) {
+	if (context.tools && context.tools.length > 0) {
 		params.tools = convertResponsesTools(context.tools);
 	}
 
 	if (model.reasoning) {
 		if (options?.reasoningEffort || options?.reasoningSummary) {
+			const effort = options?.reasoningEffort
+				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
+				: "medium";
 			params.reasoning = {
-				effort: options?.reasoningEffort || "medium",
+				effort: effort as NonNullable<typeof params.reasoning>["effort"],
 				summary: options?.reasoningSummary || "auto",
 			};
 			params.include = ["reasoning.encrypted_content"];
-		} else if (model.provider !== "github-copilot") {
-			params.reasoning = { effort: "none" };
+		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
+			params.reasoning = {
+				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
+			};
 		}
 	}
 
 	return params;
 }
 
-function getServiceTierCostMultiplier(serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined): number {
+function getServiceTierCostMultiplier(
+	model: Pick<Model<"openai-responses">, "id">,
+	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+): number {
 	switch (serviceTier) {
 		case "flex":
 			return 0.5;
 		case "priority":
-			return 2;
+			return model.id === "gpt-5.5" ? 2.5 : 2;
 		default:
 			return 1;
 	}
 }
 
-function applyServiceTierPricing(usage: Usage, serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined) {
-	const multiplier = getServiceTierCostMultiplier(serviceTier);
+function applyServiceTierPricing(
+	usage: Usage,
+	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+	model: Pick<Model<"openai-responses">, "id">,
+) {
+	const multiplier = getServiceTierCostMultiplier(model, serviceTier);
 	if (multiplier === 1) return;
 
 	usage.cost.input *= multiplier;

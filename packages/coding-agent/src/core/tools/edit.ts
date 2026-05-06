@@ -1,8 +1,8 @@
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Box, Container, Spacer, Text } from "@mariozechner/pi-tui";
-import { type Static, Type } from "@sinclair/typebox";
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
+import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.js";
 import type { ToolDefinition } from "../extensions/types.js";
 import {
@@ -341,11 +341,13 @@ export function createEditToolDefinition(
 								// Check if file exists.
 								try {
 									await ops.access(absolutePath);
-								} catch {
+								} catch (error: unknown) {
+									const errorMessage =
+										error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
 									if (signal) {
 										signal.removeEventListener("abort", onAbort);
 									}
-									reject(new Error(`File not found: ${path}`));
+									reject(new Error(`Could not edit file: ${path}. ${errorMessage}.`));
 									return;
 								}
 
@@ -465,7 +467,7 @@ export function createEditToolDefinition(
 					changed = true;
 				}
 				if (changed) {
-					context.invalidate();
+					buildEditCallComponent(callComponent, context.args as RenderableEditArgs | undefined, theme);
 				}
 			}
 

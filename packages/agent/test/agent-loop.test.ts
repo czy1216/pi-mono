@@ -6,7 +6,7 @@ import {
 	type Model,
 	type UserMessage,
 } from "@mariozechner/pi-ai";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue } from "../src/agent-loop.js";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.js";
@@ -892,6 +892,268 @@ describe("agentLoop with AgentMessage", () => {
 
 		// With executionMode=parallel, second tool should start before first finishes
 		expect(parallelObserved).toBe(true);
+	});
+
+	it("should stop after the current turn when shouldStopAfterTurn returns true", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const executed: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+
+		let steeringPolls = 0;
+		let followUpPolls = 0;
+		let callbackToolResultIds: string[] = [];
+		let callbackContextRoles: string[] = [];
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			getSteeringMessages: async () => {
+				steeringPolls++;
+				return [];
+			},
+			getFollowUpMessages: async () => {
+				followUpPolls++;
+				return [createUserMessage("follow up should stay queued")];
+			},
+			shouldStopAfterTurn: async ({ message, toolResults, context }) => {
+				expect(message.role).toBe("assistant");
+				callbackToolResultIds = toolResults.map((toolResult) => toolResult.toolCallId);
+				callbackContextRoles = context.messages.map((contextMessage) => contextMessage.role);
+				return true;
+			},
+		};
+
+		let llmCalls = 0;
+		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, () => {
+			llmCalls++;
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (llmCalls === 1) {
+					const message = createAssistantMessage(
+						[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
+						"toolUse",
+					);
+					mockStream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					mockStream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "should not run" }]),
+					});
+				}
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		expect(llmCalls).toBe(1);
+		expect(executed).toEqual(["hello"]);
+		expect(steeringPolls).toBe(1);
+		expect(followUpPolls).toBe(0);
+		expect(callbackToolResultIds).toEqual(["tool-1"]);
+		expect(callbackContextRoles).toEqual(["user", "assistant", "toolResult"]);
+		expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult"]);
+		expect(events.map((event) => event.type)).toEqual([
+			"agent_start",
+			"turn_start",
+			"message_start",
+			"message_end",
+			"message_start",
+			"message_end",
+			"tool_execution_start",
+			"tool_execution_end",
+			"message_start",
+			"message_end",
+			"turn_end",
+			"agent_end",
+		]);
+	});
+
+	it("should stop after a tool batch when every tool result sets terminate=true", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+					terminate: true,
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		let llmCalls = 0;
+		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, () => {
+			llmCalls++;
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage(
+					[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
+					"toolUse",
+				);
+				mockStream.push({ type: "done", reason: "toolUse", message });
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		expect(llmCalls).toBe(1);
+		expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult"]);
+		expect(events.filter((event) => event.type === "turn_end")).toHaveLength(1);
+	});
+
+	it("should continue after parallel tool calls when not all tool results terminate", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+					terminate: params.value === "first",
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "parallel",
+		};
+
+		let callIndex = 0;
+		const stream = agentLoop([createUserMessage("echo both")], context, config, undefined, () => {
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					const message = createAssistantMessage(
+						[
+							{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } },
+							{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "second" } },
+						],
+						"toolUse",
+					);
+					mockStream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					const message = createAssistantMessage([{ type: "text", text: "done" }]);
+					mockStream.push({ type: "done", reason: "stop", message });
+				}
+				callIndex++;
+			});
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		const messages = await stream.result();
+		expect(callIndex).toBe(2);
+		expect(messages.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"toolResult",
+			"toolResult",
+			"assistant",
+		]);
+	});
+
+	it("should allow afterToolCall to mark a tool batch as terminating", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			afterToolCall: async () => ({ terminate: true }),
+		};
+
+		let llmCalls = 0;
+		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, () => {
+			llmCalls++;
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage(
+					[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
+					"toolUse",
+				);
+				mockStream.push({ type: "done", reason: "toolUse", message });
+			});
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(llmCalls).toBe(1);
 	});
 });
 

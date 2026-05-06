@@ -14,7 +14,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import type {
 	Agent,
 	AgentEvent,
@@ -24,11 +24,18 @@ import type {
 	ThinkingLevel,
 } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
-import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
-import { getDocsPath } from "../config.js";
+import {
+	clampThinkingLevel,
+	cleanupSessionResources,
+	getSupportedThinkingLevels,
+	isContextOverflow,
+	modelsAreEqual,
+	resetApiProviders,
+} from "@mariozechner/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
+import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
 	type CompactionResult,
@@ -53,6 +60,7 @@ import {
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
+	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
 	type SessionStartEvent,
@@ -118,6 +126,8 @@ export type AgentSessionEvent =
 			followUp: readonly string[];
 	  }
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "session_info_changed"; name: string | undefined }
+	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -226,9 +236,6 @@ interface ToolDefinitionEntry {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
-
-/** Thinking levels including xhigh (for supported models) */
-const THINKING_LEVELS_WITH_XHIGH: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 // ============================================================================
 // AgentSession Class
@@ -340,6 +347,9 @@ export class AgentSession {
 	}> {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
+			if (result.error.startsWith("No API key found")) {
+				throw new Error(formatNoApiKeyFoundMessage(model.provider));
+			}
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
@@ -354,10 +364,7 @@ export class AgentSession {
 					`Run '/login ${model.provider}' to re-authenticate.`,
 			);
 		}
-		throw new Error(
-			`No API key found for ${model.provider}.\n\n` +
-				`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}`,
-		);
+		throw new Error(formatNoApiKeyFoundMessage(model.provider));
 	}
 
 	/**
@@ -608,6 +615,22 @@ export class AgentSession {
 		return undefined;
 	}
 
+	private _replaceMessageInPlace(target: AgentMessage, replacement: AgentMessage): void {
+		// Agent-core stores the finalized message object in its state before emitting message_end.
+		// SessionManager persistence happens later in _processAgentEvent() with event.message.
+		// Mutating this object in place keeps agent state, later turn/agent events, listeners,
+		// and the eventual SessionManager.appendMessage(event.message) persistence in sync.
+		if (target === replacement) {
+			return;
+		}
+
+		const targetRecord = target as unknown as Record<string, unknown>;
+		for (const key of Object.keys(targetRecord)) {
+			delete targetRecord[key];
+		}
+		Object.assign(targetRecord, replacement);
+	}
+
 	/** Emit extension events based on agent events */
 	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "agent_start") {
@@ -649,7 +672,10 @@ export class AgentSession {
 				type: "message_end",
 				message: event.message,
 			};
-			await this._extensionRunner.emit(extensionEvent);
+			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
+			if (replacement) {
+				this._replaceMessageInPlace(event.message, replacement);
+			}
 		} else if (event.type === "tool_execution_start") {
 			const extensionEvent: ToolExecutionStartEvent = {
 				type: "tool_execution_start",
@@ -722,8 +748,12 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._extensionRunner.invalidate(
+			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+		);
 		this._disconnectFromAgent();
 		this._eventListeners = [];
+		cleanupSessionResources(this.sessionId);
 	}
 
 	// =========================================================================
@@ -998,11 +1028,7 @@ export class AgentSession {
 
 			// Validate model
 			if (!this.model) {
-				throw new Error(
-					"No model selected.\n\n" +
-						`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}\n\n` +
-						"Then use /model to select a model.",
-				);
+				throw new Error(formatNoModelSelectedMessage());
 			}
 
 			if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
@@ -1014,10 +1040,7 @@ export class AgentSession {
 							`Run '/login ${this.model.provider}' to re-authenticate.`,
 					);
 				}
-				throw new Error(
-					`No API key found for ${this.model.provider}.\n\n` +
-						`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}`,
-				);
+				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 			}
 
 			// Check if we need to compact before sending (catches aborted responses)
@@ -1488,7 +1511,8 @@ export class AgentSession {
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
 		// Only persist if actually changing
-		const isChanging = effectiveLevel !== this.agent.state.thinkingLevel;
+		const previousLevel = this.agent.state.thinkingLevel;
+		const isChanging = effectiveLevel !== previousLevel;
 
 		this.agent.state.thinkingLevel = effectiveLevel;
 
@@ -1497,6 +1521,12 @@ export class AgentSession {
 			if (this.supportsThinking() || effectiveLevel !== "off") {
 				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 			}
+			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
+			void this._extensionRunner.emit({
+				type: "thinking_level_select",
+				level: effectiveLevel,
+				previousLevel,
+			});
 		}
 	}
 
@@ -1521,15 +1551,8 @@ export class AgentSession {
 	 * The provider will clamp to what the specific model supports internally.
 	 */
 	getAvailableThinkingLevels(): ThinkingLevel[] {
-		if (!this.supportsThinking()) return ["off"];
-		return this.supportsXhighThinking() ? THINKING_LEVELS_WITH_XHIGH : THINKING_LEVELS;
-	}
-
-	/**
-	 * Check if current model supports xhigh thinking level.
-	 */
-	supportsXhighThinking(): boolean {
-		return this.model ? supportsXhigh(this.model) : false;
+		if (!this.model) return THINKING_LEVELS;
+		return getSupportedThinkingLevels(this.model) as ThinkingLevel[];
 	}
 
 	/**
@@ -1549,22 +1572,8 @@ export class AgentSession {
 		return this.thinkingLevel;
 	}
 
-	private _clampThinkingLevel(level: ThinkingLevel, availableLevels: ThinkingLevel[]): ThinkingLevel {
-		const ordered = THINKING_LEVELS_WITH_XHIGH;
-		const available = new Set(availableLevels);
-		const requestedIndex = ordered.indexOf(level);
-		if (requestedIndex === -1) {
-			return availableLevels[0] ?? "off";
-		}
-		for (let i = requestedIndex; i < ordered.length; i++) {
-			const candidate = ordered[i];
-			if (available.has(candidate)) return candidate;
-		}
-		for (let i = requestedIndex - 1; i >= 0; i--) {
-			const candidate = ordered[i];
-			if (available.has(candidate)) return candidate;
-		}
-		return availableLevels[0] ?? "off";
+	private _clampThinkingLevel(level: ThinkingLevel, _availableLevels: ThinkingLevel[]): ThinkingLevel {
+		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
 	// =========================================================================
@@ -1606,7 +1615,7 @@ export class AgentSession {
 
 		try {
 			if (!this.model) {
-				throw new Error("No model selected");
+				throw new Error(formatNoModelSelectedMessage());
 			}
 
 			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
@@ -2169,7 +2178,7 @@ export class AgentSession {
 					this.sessionManager.appendCustomEntry(customType, data);
 				},
 				setSessionName: (name) => {
-					this.sessionManager.appendSessionInfo(name);
+					this.setSessionName(name);
 				},
 				getSessionName: () => {
 					return this.sessionManager.getSessionName();
@@ -2410,8 +2419,8 @@ export class AgentSession {
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		const err = message.errorMessage;
-		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), fetch failed, request ended without sending chunks, terminated, retry delay exceeded
-		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|timed? out|timeout|terminated|retry delay/i.test(
+		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, request ended without sending chunks, HTTP/2 closed before response, terminated, retry delay exceeded
+		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i.test(
 			err,
 		);
 	}
@@ -2651,6 +2660,7 @@ export class AgentSession {
 	 */
 	setSessionName(name: string): void {
 		this.sessionManager.appendSessionInfo(name);
+		this._emit({ type: "session_info_changed", name: this.sessionManager.getSessionName() });
 	}
 
 	// =========================================================================
@@ -2714,136 +2724,144 @@ export class AgentSession {
 
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
-		let extensionSummary: { summary: string; details?: unknown } | undefined;
-		let fromExtension = false;
 
-		// Emit session_before_tree event
-		if (this._extensionRunner.hasHandlers("session_before_tree")) {
-			const result = (await this._extensionRunner.emit({
-				type: "session_before_tree",
-				preparation,
-				signal: this._branchSummaryAbortController.signal,
-			})) as SessionBeforeTreeResult | undefined;
+		try {
+			let extensionSummary: { summary: string; details?: unknown } | undefined;
+			let fromExtension = false;
 
-			if (result?.cancel) {
-				return { cancelled: true };
+			// Emit session_before_tree event
+			if (this._extensionRunner.hasHandlers("session_before_tree")) {
+				const result = (await this._extensionRunner.emit({
+					type: "session_before_tree",
+					preparation,
+					signal: this._branchSummaryAbortController.signal,
+				})) as SessionBeforeTreeResult | undefined;
+
+				if (result?.cancel) {
+					return { cancelled: true };
+				}
+
+				if (result?.summary && options.summarize) {
+					extensionSummary = result.summary;
+					fromExtension = true;
+				}
+
+				// Allow extensions to override instructions and label
+				if (result?.customInstructions !== undefined) {
+					customInstructions = result.customInstructions;
+				}
+				if (result?.replaceInstructions !== undefined) {
+					replaceInstructions = result.replaceInstructions;
+				}
+				if (result?.label !== undefined) {
+					label = result.label;
+				}
 			}
 
-			if (result?.summary && options.summarize) {
-				extensionSummary = result.summary;
-				fromExtension = true;
+			// Run default summarizer if needed
+			let summaryText: string | undefined;
+			let summaryDetails: unknown;
+			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
+				const model = this.model!;
+				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
+				const result = await generateBranchSummary(entriesToSummarize, {
+					model,
+					apiKey,
+					headers,
+					signal: this._branchSummaryAbortController.signal,
+					customInstructions,
+					replaceInstructions,
+					reserveTokens: branchSummarySettings.reserveTokens,
+				});
+				if (result.aborted) {
+					return { cancelled: true, aborted: true };
+				}
+				if (result.error) {
+					throw new Error(result.error);
+				}
+				summaryText = result.summary;
+				summaryDetails = {
+					readFiles: result.readFiles || [],
+					modifiedFiles: result.modifiedFiles || [],
+				};
+			} else if (extensionSummary) {
+				summaryText = extensionSummary.summary;
+				summaryDetails = extensionSummary.details;
 			}
 
-			// Allow extensions to override instructions and label
-			if (result?.customInstructions !== undefined) {
-				customInstructions = result.customInstructions;
-			}
-			if (result?.replaceInstructions !== undefined) {
-				replaceInstructions = result.replaceInstructions;
-			}
-			if (result?.label !== undefined) {
-				label = result.label;
-			}
-		}
+			// Determine the new leaf position based on target type
+			let newLeafId: string | null;
+			let editorText: string | undefined;
 
-		// Run default summarizer if needed
-		let summaryText: string | undefined;
-		let summaryDetails: unknown;
-		if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-			const model = this.model!;
-			const { apiKey, headers } = await this._getRequiredRequestAuth(model);
-			const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
-			const result = await generateBranchSummary(entriesToSummarize, {
-				model,
-				apiKey,
-				headers,
-				signal: this._branchSummaryAbortController.signal,
-				customInstructions,
-				replaceInstructions,
-				reserveTokens: branchSummarySettings.reserveTokens,
+			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+				// User message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = this._extractUserMessageText(targetEntry.message.content);
+			} else if (targetEntry.type === "custom_message") {
+				// Custom message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText =
+					typeof targetEntry.content === "string"
+						? targetEntry.content
+						: targetEntry.content
+								.filter((c): c is { type: "text"; text: string } => c.type === "text")
+								.map((c) => c.text)
+								.join("");
+			} else {
+				// Non-user message: leaf = selected node
+				newLeafId = targetId;
+			}
+
+			// Switch leaf (with or without summary)
+			// Summary is attached at the navigation target position (newLeafId), not the old branch
+			let summaryEntry: BranchSummaryEntry | undefined;
+			if (summaryText) {
+				// Create summary at target position (can be null for root)
+				const summaryId = this.sessionManager.branchWithSummary(
+					newLeafId,
+					summaryText,
+					summaryDetails,
+					fromExtension,
+				);
+				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
+
+				// Attach label to the summary entry
+				if (label) {
+					this.sessionManager.appendLabelChange(summaryId, label);
+				}
+			} else if (newLeafId === null) {
+				// No summary, navigating to root - reset leaf
+				this.sessionManager.resetLeaf();
+			} else {
+				// No summary, navigating to non-root
+				this.sessionManager.branch(newLeafId);
+			}
+
+			// Attach label to target entry when not summarizing (no summary entry to label)
+			if (label && !summaryText) {
+				this.sessionManager.appendLabelChange(targetId, label);
+			}
+
+			// Update agent state
+			const sessionContext = this.sessionManager.buildSessionContext();
+			this.agent.state.messages = sessionContext.messages;
+
+			// Emit session_tree event
+			await this._extensionRunner.emit({
+				type: "session_tree",
+				newLeafId: this.sessionManager.getLeafId(),
+				oldLeafId,
+				summaryEntry,
+				fromExtension: summaryText ? fromExtension : undefined,
 			});
+
+			// Emit to custom tools
+
+			return { editorText, cancelled: false, summaryEntry };
+		} finally {
 			this._branchSummaryAbortController = undefined;
-			if (result.aborted) {
-				return { cancelled: true, aborted: true };
-			}
-			if (result.error) {
-				throw new Error(result.error);
-			}
-			summaryText = result.summary;
-			summaryDetails = {
-				readFiles: result.readFiles || [],
-				modifiedFiles: result.modifiedFiles || [],
-			};
-		} else if (extensionSummary) {
-			summaryText = extensionSummary.summary;
-			summaryDetails = extensionSummary.details;
 		}
-
-		// Determine the new leaf position based on target type
-		let newLeafId: string | null;
-		let editorText: string | undefined;
-
-		if (targetEntry.type === "message" && targetEntry.message.role === "user") {
-			// User message: leaf = parent (null if root), text goes to editor
-			newLeafId = targetEntry.parentId;
-			editorText = this._extractUserMessageText(targetEntry.message.content);
-		} else if (targetEntry.type === "custom_message") {
-			// Custom message: leaf = parent (null if root), text goes to editor
-			newLeafId = targetEntry.parentId;
-			editorText =
-				typeof targetEntry.content === "string"
-					? targetEntry.content
-					: targetEntry.content
-							.filter((c): c is { type: "text"; text: string } => c.type === "text")
-							.map((c) => c.text)
-							.join("");
-		} else {
-			// Non-user message: leaf = selected node
-			newLeafId = targetId;
-		}
-
-		// Switch leaf (with or without summary)
-		// Summary is attached at the navigation target position (newLeafId), not the old branch
-		let summaryEntry: BranchSummaryEntry | undefined;
-		if (summaryText) {
-			// Create summary at target position (can be null for root)
-			const summaryId = this.sessionManager.branchWithSummary(newLeafId, summaryText, summaryDetails, fromExtension);
-			summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
-
-			// Attach label to the summary entry
-			if (label) {
-				this.sessionManager.appendLabelChange(summaryId, label);
-			}
-		} else if (newLeafId === null) {
-			// No summary, navigating to root - reset leaf
-			this.sessionManager.resetLeaf();
-		} else {
-			// No summary, navigating to non-root
-			this.sessionManager.branch(newLeafId);
-		}
-
-		// Attach label to target entry when not summarizing (no summary entry to label)
-		if (label && !summaryText) {
-			this.sessionManager.appendLabelChange(targetId, label);
-		}
-
-		// Update agent state
-		const sessionContext = this.sessionManager.buildSessionContext();
-		this.agent.state.messages = sessionContext.messages;
-
-		// Emit session_tree event
-		await this._extensionRunner.emit({
-			type: "session_tree",
-			newLeafId: this.sessionManager.getLeafId(),
-			oldLeafId,
-			summaryEntry,
-			fromExtension: summaryText ? fromExtension : undefined,
-		});
-
-		// Emit to custom tools
-
-		this._branchSummaryAbortController = undefined;
-		return { editorText, cancelled: false, summaryEntry };
 	}
 
 	/**
@@ -3065,6 +3083,16 @@ export class AgentSession {
 	// =========================================================================
 	// Extension System
 	// =========================================================================
+
+	createReplacedSessionContext(): ReplacedSessionContext {
+		const context = Object.defineProperties(
+			{},
+			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext()),
+		) as ReplacedSessionContext;
+		context.sendMessage = (message, options) => this.sendCustomMessage(message, options);
+		context.sendUserMessage = (content, options) => this.sendUserMessage(content, options);
+		return context;
+	}
 
 	/**
 	 * Check if extensions have handlers for a specific event type.

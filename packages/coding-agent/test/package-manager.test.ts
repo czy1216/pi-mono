@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DefaultPackageManager, type ProgressEvent, type ResolvedResource } from "../src/core/package-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { shouldUseWindowsShell } from "../src/utils/child-process.js";
 
 function normalizeForMatch(value: string): string {
 	return value.replace(/\\/g, "/");
@@ -156,6 +157,74 @@ Content`,
 
 			const result = await packageManager.resolve();
 			expect(result.prompts.some((r) => r.path === promptPath && !r.enabled)).toBe(true);
+		});
+
+		it("should resolve symlinked user and project resources once", async () => {
+			const previousHome = process.env.HOME;
+			process.env.HOME = tempDir;
+
+			try {
+				const sharedDir = join(tempDir, "shared-resources");
+				const sharedExtensionsDir = join(sharedDir, "extensions");
+				const sharedSkillsDir = join(sharedDir, "skills");
+				const sharedPromptsDir = join(sharedDir, "prompts");
+				const sharedThemesDir = join(sharedDir, "themes");
+				mkdirSync(sharedExtensionsDir, { recursive: true });
+				mkdirSync(sharedSkillsDir, { recursive: true });
+				mkdirSync(sharedPromptsDir, { recursive: true });
+				mkdirSync(sharedThemesDir, { recursive: true });
+
+				writeFileSync(join(sharedExtensionsDir, "shared.ts"), "export default function() {}");
+				mkdirSync(join(sharedSkillsDir, "shared-skill"), { recursive: true });
+				writeFileSync(
+					join(sharedSkillsDir, "shared-skill", "SKILL.md"),
+					`---
+name: shared-skill
+description: Shared skill
+---
+Content`,
+				);
+				writeFileSync(join(sharedPromptsDir, "shared.md"), "Shared prompt");
+				writeFileSync(join(sharedThemesDir, "shared.json"), JSON.stringify({ name: "shared-theme" }));
+
+				mkdirSync(join(agentDir), { recursive: true });
+				mkdirSync(join(tempDir, ".pi"), { recursive: true });
+				symlinkSync(sharedExtensionsDir, join(agentDir, "extensions"), "dir");
+				symlinkSync(sharedSkillsDir, join(agentDir, "skills"), "dir");
+				symlinkSync(sharedPromptsDir, join(agentDir, "prompts"), "dir");
+				symlinkSync(sharedThemesDir, join(agentDir, "themes"), "dir");
+				symlinkSync(sharedExtensionsDir, join(tempDir, ".pi", "extensions"), "dir");
+				symlinkSync(sharedSkillsDir, join(tempDir, ".pi", "skills"), "dir");
+				symlinkSync(sharedPromptsDir, join(tempDir, ".pi", "prompts"), "dir");
+				symlinkSync(sharedThemesDir, join(tempDir, ".pi", "themes"), "dir");
+
+				const result = await packageManager.resolve();
+
+				expect({
+					extensions: result.extensions.length,
+					skills: result.skills.length,
+					prompts: result.prompts.length,
+					themes: result.themes.length,
+				}).toEqual({
+					extensions: 1,
+					skills: 1,
+					prompts: 1,
+					themes: 1,
+				});
+
+				// Project auto-discovered has higher precedence than user auto-discovered,
+				// so the surviving entry should be scoped to project.
+				expect(result.extensions[0].metadata.scope).toBe("project");
+				expect(result.skills[0].metadata.scope).toBe("project");
+				expect(result.prompts[0].metadata.scope).toBe("project");
+				expect(result.themes[0].metadata.scope).toBe("project");
+			} finally {
+				if (previousHome === undefined) {
+					delete process.env.HOME;
+				} else {
+					process.env.HOME = previousHome;
+				}
+			}
 		});
 
 		it("should auto-discover project prompts with overrides", async () => {
@@ -460,6 +529,17 @@ Content`,
 		});
 	});
 
+	describe("windows command spawning", () => {
+		it("should avoid the shell for git so Windows paths with spaces stay single arguments", () => {
+			vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+
+			expect(shouldUseWindowsShell("git")).toBe(false);
+			expect(shouldUseWindowsShell("npm")).toBe(true);
+			expect(shouldUseWindowsShell("pnpm")).toBe(true);
+			expect(shouldUseWindowsShell("C:/Program Files/nodejs/npm.cmd")).toBe(true);
+		});
+	});
+
 	describe("npmCommand", () => {
 		it("should use npmCommand argv for npm installs", async () => {
 			settingsManager = SettingsManager.inMemory({
@@ -500,6 +580,33 @@ Content`,
 			expect(runCommandSpy).toHaveBeenCalledWith("npm", ["install", "--omit=dev"], { cwd: targetDir });
 		});
 
+		it("should use plain install for git package dependencies when npmCommand is configured", async () => {
+			settingsManager = SettingsManager.inMemory({
+				npmCommand: ["pnpm"],
+			});
+			packageManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+			});
+
+			const source = "git:github.com/user/repo";
+			const targetDir = join(agentDir, "git", "github.com", "user", "repo");
+			const runCommandSpy = vi
+				.spyOn(packageManager as any, "runCommand")
+				.mockImplementation(async (...callArgs: unknown[]) => {
+					const [command, args] = callArgs as [string, string[]];
+					if (command === "git" && args[0] === "clone") {
+						mkdirSync(targetDir, { recursive: true });
+						writeFileSync(join(targetDir, "package.json"), JSON.stringify({ name: "repo", version: "1.0.0" }));
+					}
+				});
+
+			await packageManager.install(source);
+
+			expect(runCommandSpy).toHaveBeenCalledWith("pnpm", ["install"], { cwd: targetDir });
+		});
+
 		it("should update git package dependencies with --omit=dev", async () => {
 			const source = "git:github.com/user/repo";
 			const targetDir = join(tempDir, ".pi", "git", "github.com", "user", "repo");
@@ -525,6 +632,44 @@ Content`,
 			await packageManager.update(source);
 
 			expect(runCommandSpy).toHaveBeenCalledWith("npm", ["install", "--omit=dev"], { cwd: targetDir });
+		});
+
+		it("should use plain install through npmCommand argv when updating git package dependencies", async () => {
+			settingsManager = SettingsManager.inMemory({
+				npmCommand: ["mise", "exec", "node@20", "--", "pnpm"],
+			});
+			packageManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+			});
+
+			const source = "git:github.com/user/repo";
+			const targetDir = join(tempDir, ".pi", "git", "github.com", "user", "repo");
+			mkdirSync(targetDir, { recursive: true });
+			writeFileSync(join(targetDir, "package.json"), JSON.stringify({ name: "repo", version: "1.0.0" }));
+			settingsManager.setProjectPackages([source]);
+
+			vi.spyOn(packageManager as any, "runCommandCapture").mockImplementation(async (...callArgs: unknown[]) => {
+				const [_command, args] = callArgs as [string, string[]];
+				if (args[0] === "rev-parse" && args[1] === "--abbrev-ref" && args[2] === "@{upstream}") {
+					return "origin/main";
+				}
+				if (args[0] === "rev-parse" && args[1] === "@{upstream}") {
+					return "remote-head";
+				}
+				if (args[0] === "rev-parse" && args[1] === "HEAD") {
+					return "local-head";
+				}
+				throw new Error(`Unexpected runCommandCapture args: ${args.join(" ")}`);
+			});
+			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockResolvedValue(undefined);
+
+			await packageManager.update(source);
+
+			expect(runCommandSpy).toHaveBeenCalledWith("mise", ["exec", "node@20", "--", "pnpm", "install"], {
+				cwd: targetDir,
+			});
 		});
 
 		it("should use npmCommand argv for npm root lookup and invalidate cached root when npmCommand changes", () => {
