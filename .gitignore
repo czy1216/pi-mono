@@ -19,6 +19,7 @@ packages/*/dist-firefox/
 *.swp
 *.swo
 *~
+.sessions/
 
 # Package specific
 .npm/
@@ -38,5 +39,3 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
-
-/learn
