@@ -69,6 +69,58 @@ const KIMI_STATIC_HEADERS = {
 	"User-Agent": "KimiCLI/1.5",
 } as const;
 
+const TOGETHER_BASE_URL = "https://api.together.ai/v1";
+const TOGETHER_BASE_COMPAT: OpenAICompletionsCompat = {
+	supportsStore: false,
+	supportsDeveloperRole: false,
+	supportsReasoningEffort: false,
+	maxTokensField: "max_tokens",
+	supportsStrictMode: false,
+	supportsLongCacheRetention: false,
+};
+const TOGETHER_TOGGLE_REASONING_COMPAT: OpenAICompletionsCompat = {
+	...TOGETHER_BASE_COMPAT,
+	thinkingFormat: "together",
+};
+const TOGETHER_REASONING_EFFORT_COMPAT: OpenAICompletionsCompat = {
+	...TOGETHER_BASE_COMPAT,
+	supportsReasoningEffort: true,
+	thinkingFormat: "openai",
+};
+const TOGETHER_TOGGLE_REASONING_EFFORT_COMPAT: OpenAICompletionsCompat = {
+	...TOGETHER_TOGGLE_REASONING_COMPAT,
+	supportsReasoningEffort: true,
+};
+const TOGETHER_REASONING_ONLY_MODELS = new Set([
+	"deepseek-ai/DeepSeek-R1",
+	"MiniMaxAI/MiniMax-M2.5",
+	"MiniMaxAI/MiniMax-M2.7",
+]);
+const TOGETHER_REASONING_EFFORT_MODELS = new Set(["openai/gpt-oss-20b", "openai/gpt-oss-120b"]);
+const TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set(["deepseek-ai/DeepSeek-V4-Pro"]);
+const TOGETHER_FIXED_REASONING_LEVEL_MAP = {
+	off: null,
+	minimal: null,
+	low: null,
+	medium: null,
+} as const;
+const TOGETHER_REASONING_EFFORT_LEVEL_MAP = {
+	off: null,
+	minimal: null,
+} as const;
+const TOGETHER_DEEPSEEK_V4_THINKING_LEVEL_MAP = {
+	minimal: null,
+	low: null,
+	medium: null,
+	high: "high",
+	xhigh: null,
+} as const;
+const TOGETHER_TOGGLE_REASONING_LEVEL_MAP = {
+	minimal: null,
+	low: null,
+	medium: null,
+} as const;
+
 const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
 const ZAI_TOOL_STREAM_UNSUPPORTED_MODELS = new Set(["glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v"]);
@@ -86,8 +138,37 @@ const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	xhigh: "max",
 } as const;
 
+const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
+	"gpt-5.1",
+	"gpt-5.2",
+	"gpt-5.3-codex",
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.4-nano",
+	"gpt-5.5",
+]);
+
 function mergeThinkingLevelMap(model: Model<any>, map: NonNullable<Model<any>["thinkingLevelMap"]>): void {
 	model.thinkingLevelMap = { ...model.thinkingLevelMap, ...map };
+}
+
+function getTogetherCompat(modelId: string, reasoning: boolean): OpenAICompletionsCompat {
+	if (!reasoning) return TOGETHER_BASE_COMPAT;
+	if (TOGETHER_REASONING_EFFORT_MODELS.has(modelId)) return TOGETHER_REASONING_EFFORT_COMPAT;
+	if (TOGETHER_TOGGLE_REASONING_EFFORT_MODELS.has(modelId)) return TOGETHER_TOGGLE_REASONING_EFFORT_COMPAT;
+	if (TOGETHER_REASONING_ONLY_MODELS.has(modelId)) return TOGETHER_BASE_COMPAT;
+	return TOGETHER_TOGGLE_REASONING_COMPAT;
+}
+
+function getTogetherThinkingLevelMap(
+	modelId: string,
+	reasoning: boolean,
+): NonNullable<Model<any>["thinkingLevelMap"]> | undefined {
+	if (!reasoning) return undefined;
+	if (TOGETHER_REASONING_EFFORT_MODELS.has(modelId)) return { ...TOGETHER_REASONING_EFFORT_LEVEL_MAP };
+	if (TOGETHER_TOGGLE_REASONING_EFFORT_MODELS.has(modelId)) return { ...TOGETHER_DEEPSEEK_V4_THINKING_LEVEL_MAP };
+	if (TOGETHER_REASONING_ONLY_MODELS.has(modelId)) return { ...TOGETHER_FIXED_REASONING_LEVEL_MAP };
+	return { ...TOGETHER_TOGGLE_REASONING_LEVEL_MAP };
 }
 
 function supportsOpenAiXhigh(modelId: string): boolean {
@@ -122,6 +203,16 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	) {
 		mergeThinkingLevelMap(model, { off: null });
 	}
+	if (model.provider === "github-copilot" && model.id.startsWith("gpt-5")) {
+		mergeThinkingLevelMap(model, { minimal: "low" });
+	}
+	if (
+		model.api === "openai-responses" &&
+		model.provider === "openai" &&
+		OPENAI_RESPONSES_NONE_REASONING_MODELS.has(model.id)
+	) {
+		mergeThinkingLevelMap(model, { off: "none" });
+	}
 	if (supportsOpenAiXhigh(model.id)) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
 	}
@@ -149,8 +240,12 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.provider === "openai-codex" && supportsOpenAiXhigh(model.id)) {
 		mergeThinkingLevelMap(model, { minimal: "low" });
 	}
-	if (model.provider === "openai-codex" && model.id === "gpt-5.1-codex-mini") {
-		mergeThinkingLevelMap(model, { minimal: "medium", low: "medium", medium: "medium", high: "high" });
+	if (model.provider === "openrouter" && model.id.startsWith("inception/mercury-2")) {
+		// Mercury 2 in instant mode (reasoning_effort: "none") disables tool calling.
+		// Mark "off" unsupported so the openai-completions provider omits the reasoning param
+		// instead of defaulting to {reasoning:{effort:"none"}} (see openai-completions.ts:575).
+		// Pi's low/medium/high pass through verbatim; OpenRouter normalizes to Mercury's vocabulary.
+		mergeThinkingLevelMap(model, { off: null });
 	}
 }
 
@@ -676,6 +771,48 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					},
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
+					// Fireworks prompt caching uses automatic prefix matching + session affinity.
+					// x-session-affinity routes requests to the same replica for cache hits.
+					// cache_control on tools and eager_input_streaming are not supported.
+					// See: https://docs.fireworks.ai/tools-sdks/anthropic-compatibility
+					compat: {
+						sendSessionAffinityHeaders: true,
+						supportsEagerToolInputStreaming: false,
+						supportsCacheControlOnTools: false,
+						supportsLongCacheRetention: false,
+					},
+				});
+			}
+		}
+
+		// Process Together AI models
+		const togetherProvider = data.together ?? data.togetherai ?? data["together-ai"];
+		if (togetherProvider?.models) {
+			for (const [modelId, model] of Object.entries(togetherProvider.models)) {
+				const m = model as ModelsDevModel & { status?: string };
+				if (m.tool_call !== true) continue;
+				if (m.status === "deprecated") continue;
+
+				const reasoning = m.reasoning === true;
+				const thinkingLevelMap = getTogetherThinkingLevelMap(modelId, reasoning);
+				models.push({
+					id: modelId,
+					name: m.name || modelId,
+					api: "openai-completions",
+					provider: "together",
+					baseUrl: TOGETHER_BASE_URL,
+					reasoning,
+					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+					cost: {
+						input: m.cost?.input || 0,
+						output: m.cost?.output || 0,
+						cacheRead: m.cost?.cache_read || 0,
+						cacheWrite: m.cost?.cache_write || 0,
+					},
+					compat: getTogetherCompat(modelId, reasoning),
+					contextWindow: m.limit?.context || 4096,
+					maxTokens: m.limit?.output || 4096,
 				});
 			}
 		}
@@ -936,11 +1073,15 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		// Built-in `xiaomi` targets the API billing endpoint (single stable URL,
 		// keys from platform.xiaomimimo.com). The three `xiaomi-token-plan-*`
 		// providers cover prepaid Token Plan endpoints in cn / ams / sgp.
+		const xiaomiCompat: OpenAICompletionsCompat = {
+			requiresReasoningContentOnAssistantMessages: true,
+			thinkingFormat: "deepseek",
+		};
 		const xiaomiVariants = [
-			{ provider: "xiaomi", baseUrl: "https://api.xiaomimimo.com/anthropic" },
-			{ provider: "xiaomi-token-plan-cn", baseUrl: "https://token-plan-cn.xiaomimimo.com/anthropic" },
-			{ provider: "xiaomi-token-plan-ams", baseUrl: "https://token-plan-ams.xiaomimimo.com/anthropic" },
-			{ provider: "xiaomi-token-plan-sgp", baseUrl: "https://token-plan-sgp.xiaomimimo.com/anthropic" },
+			{ provider: "xiaomi", baseUrl: "https://api.xiaomimimo.com/v1" },
+			{ provider: "xiaomi-token-plan-cn", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" },
+			{ provider: "xiaomi-token-plan-ams", baseUrl: "https://token-plan-ams.xiaomimimo.com/v1" },
+			{ provider: "xiaomi-token-plan-sgp", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1" },
 		] as const;
 
 		if (data.xiaomi?.models) {
@@ -952,9 +1093,10 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					models.push({
 						id: modelId,
 						name: m.name || modelId,
-						api: "anthropic-messages",
+						api: "openai-completions",
 						provider,
 						baseUrl,
+						compat: xiaomiCompat,
 						reasoning: m.reasoning === true,
 						input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 						cost: {
@@ -1361,56 +1503,8 @@ async function generateModels() {
 	const CODEX_MAX_TOKENS = 128000;
 	const codexModels: Model<"openai-codex-responses">[] = [
 		{
-			id: "gpt-5.1",
-			name: "GPT-5.1",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
-			id: "gpt-5.1-codex-max",
-			name: "GPT-5.1 Codex Max",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
-			id: "gpt-5.1-codex-mini",
-			name: "GPT-5.1 Codex Mini",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 0.25, output: 2, cacheRead: 0.025, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
 			id: "gpt-5.2",
 			name: "GPT-5.2",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
-			id: "gpt-5.2-codex",
-			name: "GPT-5.2 Codex",
 			api: "openai-codex-responses",
 			provider: "openai-codex",
 			baseUrl: CODEX_BASE_URL,
@@ -1433,6 +1527,18 @@ async function generateModels() {
 			maxTokens: CODEX_MAX_TOKENS,
 		},
 		{
+			id: "gpt-5.3-codex-spark",
+			name: "GPT-5.3 Codex Spark",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
 			id: "gpt-5.4",
 			name: "GPT-5.4",
 			api: "openai-codex-responses",
@@ -1441,6 +1547,18 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-5.4-mini",
+			name: "GPT-5.4 mini",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
@@ -1456,36 +1574,36 @@ async function generateModels() {
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
-		{
-			id: "gpt-5.4-mini",
-			name: "GPT-5.4 Mini",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
-			id: "gpt-5.3-codex-spark",
-			name: "GPT-5.3 Codex Spark",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128000,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
 	];
 	allModels.push(...codexModels);
 
 	// Add missing Grok models
-	if (!allModels.some(m => m.provider === "xai" && m.id === "grok-code-fast-1")) {
-		allModels.push({
+	const missingGrokModels: Model<"openai-completions">[] = [
+		{
+			id: "grok-3",
+			name: "Grok 3",
+			api: "openai-completions",
+			baseUrl: "https://api.x.ai/v1",
+			provider: "xai",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 3, output: 15, cacheRead: 0.75, cacheWrite: 0 },
+			contextWindow: 131072,
+			maxTokens: 8192,
+		},
+		{
+			id: "grok-3-fast",
+			name: "Grok 3 Fast",
+			api: "openai-completions",
+			baseUrl: "https://api.x.ai/v1",
+			provider: "xai",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 5, output: 25, cacheRead: 1.25, cacheWrite: 0 },
+			contextWindow: 131072,
+			maxTokens: 8192,
+		},
+		{
 			id: "grok-code-fast-1",
 			name: "Grok Code Fast 1",
 			api: "openai-completions",
@@ -1501,7 +1619,12 @@ async function generateModels() {
 			},
 			contextWindow: 32768,
 			maxTokens: 8192,
-		});
+		},
+	];
+	for (const model of missingGrokModels) {
+		if (!allModels.some(m => m.provider === model.provider && m.id === model.id)) {
+			allModels.push(model);
+		}
 	}
 
 	// Add missing Mistral Medium 3.5 model until models.dev includes it

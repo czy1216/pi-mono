@@ -17,8 +17,8 @@ import {
 	registerApiProvider,
 	resetApiProviders,
 	type SimpleStreamOptions,
-} from "@mariozechner/pi-ai";
-import { registerOAuthProvider, resetOAuthProviders } from "@mariozechner/pi-ai/oauth";
+} from "@earendil-works/pi-ai";
+import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { type Static, Type } from "typebox";
@@ -105,6 +105,7 @@ const OpenAICompletionsCompatSchema = Type.Object({
 		Type.Union([
 			Type.Literal("openai"),
 			Type.Literal("openrouter"),
+			Type.Literal("together"),
 			Type.Literal("deepseek"),
 			Type.Literal("zai"),
 			Type.Literal("qwen"),

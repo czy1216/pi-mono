@@ -7,7 +7,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	getProviders,
@@ -16,7 +16,7 @@ import {
 	type Model,
 	type OAuthProviderId,
 	type OAuthSelectPrompt,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -27,12 +27,14 @@ import type {
 	OverlayHandle,
 	OverlayOptions,
 	SlashCommand,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
 	fuzzyFilter,
+	getCapabilities,
+	hyperlink,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
@@ -44,7 +46,7 @@ import {
 	TruncatedText,
 	TUI,
 	visibleWidth,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
 import {
 	APP_NAME,
@@ -85,6 +87,7 @@ import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/cha
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
+import { getCwdRelativePath } from "../../utils/paths.js";
 import { getPiUserAgent } from "../../utils/pi-user-agent.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool } from "../../utils/tools-manager.js";
@@ -105,7 +108,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FooterComponent } from "./components/footer.js";
-import { keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
+import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
 import { ModelSelectorComponent } from "./components/model-selector.js";
 import { type AuthSelectorProvider, OAuthSelectorComponent } from "./components/oauth-selector.js";
@@ -569,6 +572,21 @@ export class InteractiveMode {
 		const [fdPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
 		this.fdPath = fdPath;
 
+		if (this.session.scopedModels.length > 0 && (this.options.verbose || !this.settingsManager.getQuietStartup())) {
+			const modelList = this.session.scopedModels
+				.map((sm) => {
+					const thinkingStr = sm.thinkingLevel ? `:${sm.thinkingLevel}` : "";
+					return `${sm.model.id}${thinkingStr}`;
+				})
+				.join(", ");
+			const cycleKeys = this.keybindings.getKeys("app.model.cycleForward");
+			const cycleHint =
+				cycleKeys.length > 0
+					? theme.fg("muted", ` (${formatKeyText(cycleKeys.join("/"), { capitalize: true })} to cycle)`)
+					: "";
+			console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
+		}
+
 		// Add header container as first child
 		this.ui.addChild(this.headerContainer);
 
@@ -911,15 +929,9 @@ export class InteractiveMode {
 	private formatContextPath(p: string): string {
 		const cwd = path.resolve(this.sessionManager.getCwd());
 		const absolutePath = path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd, p);
-		const relativePath = path.relative(cwd, absolutePath);
-		const isInsideCwd =
-			relativePath === "" ||
-			(!relativePath.startsWith("..") &&
-				!relativePath.startsWith(`..${path.sep}`) &&
-				!path.isAbsolute(relativePath));
-
-		if (isInsideCwd) {
-			return relativePath || ".";
+		const relativePath = getCwdRelativePath(absolutePath, cwd);
+		if (relativePath !== undefined) {
+			return relativePath;
 		}
 
 		return this.formatDisplayPath(absolutePath);
@@ -2027,7 +2039,7 @@ export class InteractiveMode {
 					this.hideExtensionSelector();
 					resolve(undefined);
 				},
-				{ tui: this.ui, timeout: opts?.timeout },
+				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
 			);
 
 			this.editorContainer.clear();
@@ -3248,6 +3260,36 @@ export class InteractiveMode {
 	}
 
 	/**
+	 * Last-resort handler for uncaught exceptions. The TUI puts stdin into raw
+	 * mode and hides the cursor; without this handler, an uncaught throw from
+	 * anywhere (e.g. an extension's async `ChildProcess.on("exit")` callback)
+	 * tears down the process while leaving the terminal in raw mode with no
+	 * cursor, requiring `stty sane && reset` to recover.
+	 *
+	 * Unlike emergencyTerminalExit, the terminal is still alive here, so we
+	 * call ui.stop() to restore cooked mode, the cursor, and disable bracketed
+	 * paste / Kitty / modifyOtherKeys sequences.
+	 */
+	private uncaughtCrash(error: Error): never {
+		if (this.isShuttingDown) {
+			process.exit(1);
+		}
+		this.isShuttingDown = true;
+		try {
+			this.unregisterSignalHandlers();
+		} catch {}
+		try {
+			killTrackedDetachedChildren();
+		} catch {}
+		try {
+			this.ui.stop();
+		} catch {}
+		console.error("pi exiting due to uncaughtException:");
+		console.error(error);
+		process.exit(1);
+	}
+
+	/**
 	 * Check if shutdown was requested and perform shutdown if so.
 	 */
 	private async checkShutdownRequested(): Promise<void> {
@@ -3285,6 +3327,13 @@ export class InteractiveMode {
 		process.stderr.on("error", terminalErrorHandler);
 		this.signalCleanupHandlers.push(() => process.stdout.off("error", terminalErrorHandler));
 		this.signalCleanupHandlers.push(() => process.stderr.off("error", terminalErrorHandler));
+
+		// Restore the terminal before the process dies on any uncaught throw.
+		// Without this, an unhandled exception from extension code (or anywhere
+		// in pi) leaves the terminal in raw mode with no cursor.
+		const uncaughtExceptionHandler = (error: Error) => this.uncaughtCrash(error);
+		process.prependListener("uncaughtException", uncaughtExceptionHandler);
+		this.signalCleanupHandlers.push(() => process.off("uncaughtException", uncaughtExceptionHandler));
 	}
 
 	private unregisterSignalHandlers(): void {
@@ -3448,7 +3497,7 @@ export class InteractiveMode {
 		this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
 	}
 
-	private openExternalEditor(): void {
+	private async openExternalEditor(): Promise<void> {
 		// Determine editor (respect $VISUAL, then $EDITOR)
 		const editorCmd = process.env.VISUAL || process.env.EDITOR;
 		if (!editorCmd) {
@@ -3469,14 +3518,22 @@ export class InteractiveMode {
 			// Split by space to support editor arguments (e.g., "code --wait")
 			const [editor, ...editorArgs] = editorCmd.split(" ");
 
-			// Spawn editor synchronously with inherited stdio for interactive editing
-			const result = spawnSync(editor, [...editorArgs, tmpFile], {
-				stdio: "inherit",
-				shell: process.platform === "win32",
+			process.stdout.write(`Launching external editor: ${editorCmd}\nPi will resume when the editor exits.\n`);
+
+			// Do not use spawnSync here. On Windows, synchronous child_process calls can keep
+			// Node/libuv's console input read active after ui.stop() pauses stdin, racing
+			// vim/nvim for the console input buffer until Ctrl+C cancels the pending read.
+			const status = await new Promise<number | null>((resolve) => {
+				const child = spawn(editor, [...editorArgs, tmpFile], {
+					stdio: "inherit",
+					shell: process.platform === "win32",
+				});
+				child.on("error", () => resolve(null));
+				child.on("close", (code) => resolve(code));
 			});
 
 			// On successful exit (status 0), replace editor content
-			if (result.status === 0) {
+			if (status === 0) {
 				const newContent = fs.readFileSync(tmpFile, "utf-8").replace(/\n$/, "");
 				this.editor.setText(newContent);
 			}
@@ -3508,6 +3565,7 @@ export class InteractiveMode {
 	showError(errorMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		this.chatContainer.addChild(new Spacer(1));
 		this.ui.requestRender();
 	}
 
@@ -3520,11 +3578,11 @@ export class InteractiveMode {
 	showNewVersionNotification(newVersion: string): void {
 		const action = theme.fg("accent", `${APP_NAME} update`);
 		const updateInstruction = theme.fg("muted", `New version ${newVersion} is available. Run `) + action;
-		const changelogUrl = theme.fg(
-			"accent",
-			"https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md",
-		);
-		const changelogLine = theme.fg("muted", "Changelog: ") + changelogUrl;
+		const changelogUrl = "https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md";
+		const changelogLink = getCapabilities().hyperlinks
+			? hyperlink(theme.fg("accent", "open changelog"), changelogUrl)
+			: theme.fg("accent", changelogUrl);
+		const changelogLine = theme.fg("muted", "Changelog: ") + changelogLink;
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
@@ -5141,32 +5199,17 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Capitalize keybinding for display (e.g., "ctrl+c" -> "Ctrl+C").
-	 */
-	private capitalizeKey(key: string): string {
-		return key
-			.split("/")
-			.map((k) =>
-				k
-					.split("+")
-					.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-					.join("+"),
-			)
-			.join("/");
-	}
-
-	/**
 	 * Get capitalized display string for an app keybinding action.
 	 */
 	private getAppKeyDisplay(action: AppKeybinding): string {
-		return this.capitalizeKey(keyText(action));
+		return keyDisplayText(action);
 	}
 
 	/**
 	 * Get capitalized display string for an editor keybinding action.
 	 */
 	private getEditorKeyDisplay(action: Keybinding): string {
-		return this.capitalizeKey(keyText(action));
+		return keyDisplayText(action);
 	}
 
 	private handleHotkeysCommand(): void {
@@ -5270,7 +5313,7 @@ export class InteractiveMode {
 `;
 			for (const [key, shortcut] of shortcuts) {
 				const description = shortcut.description ?? shortcut.extensionPath;
-				const keyDisplay = key.replace(/\b\w/g, (c) => c.toUpperCase());
+				const keyDisplay = formatKeyText(key, { capitalize: true });
 				hotkeys += `| \`${keyDisplay}\` | ${description} |\n`;
 			}
 		}
