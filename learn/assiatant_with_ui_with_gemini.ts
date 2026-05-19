@@ -16,9 +16,9 @@ import {
 	createAgentSession,
 	SessionManager,
 	estimateTokens,
-} from "@mariozechner/pi-coding-agent";
-import { streamSimple, Type, type Model } from "@mariozechner/pi-ai";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
+} from "@earendil-works/pi-coding-agent";
+import { streamSimple, Type, type Model } from "@earendil-works/pi-ai";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	TUI,
 	ProcessTerminal,
@@ -27,8 +27,8 @@ import {
 	Text,
 	Loader,
 	CombinedAutocompleteProvider,
-} from "@mariozechner/pi-tui";
-import type { EditorTheme, MarkdownTheme } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
+import type { EditorTheme, MarkdownTheme } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import * as path from "path";
 import * as fs from "fs";
